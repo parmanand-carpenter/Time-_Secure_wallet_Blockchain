@@ -5,6 +5,7 @@
   "description": "Backend system for Time-Delay Smart Contract Wallet",
   "main": "src/index.js",
   "scripts": {
+    "build": "prisma generate && prisma db push --accept-data-loss",
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "db:generate": "prisma generate",
