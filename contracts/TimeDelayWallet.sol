@@ -19,6 +19,7 @@ contract TimeDelayWallet is ReentrancyGuard {
     // ================= PLATFORM CONTROL =================
 
     address public platformAdmin;
+    address public pendingPlatformAdmin; // set during two-step platform admin transfer
 
     // ================= COMMISSION =================
 
@@ -28,8 +29,7 @@ contract TimeDelayWallet is ReentrancyGuard {
 
     // ================= CORE =================
 
-    /// @dev MUST be changed to 24 hours (86400) before mainnet deployment.
-    uint256 public constant DELAY = 2 minutes;
+    uint256 public constant DELAY = 24 hours;
 
     bool public initialized;
 
@@ -53,10 +53,16 @@ contract TimeDelayWallet is ReentrancyGuard {
     ///         Only _value is tracked here — fee is sent to platformAdmin immediately.
     mapping(address => uint256) public lockedAmount;
 
-    /// @dev WARNING: 1e13 is 18-decimal based. May be too low for ERC20s with fewer decimals (e.g. USDC).
+    /// @dev Fallback global minimum. Use setTokenMinTxAmount for per-token overrides.
     uint256 public minTxAmount;
 
-    /// @notice When paused, queue and execute are blocked. Cancel is always available.
+    /// @notice Per-token minimum transaction amount. Overrides minTxAmount when set.
+    mapping(address => uint256) public tokenMinTxAmount;
+
+    /// @notice Accumulated fees that could not be transferred directly to platformAdmin.
+    mapping(address => uint256) public unclaimedFees;
+
+    /// @notice When paused, only queueTransaction is blocked. executeTransaction remains available.
     bool public paused;
 
     // ================= EVENTS =================
@@ -75,6 +81,10 @@ contract TimeDelayWallet is ReentrancyGuard {
     event TransactionCancelledDetailed(uint256 indexed txId, address token, uint256 value);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    event PauseToggled(bool paused);
+    event FeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
+    event PlatformAdminTransferStarted(address indexed currentAdmin, address indexed pendingAdmin);
+    event PlatformAdminUpdated(address indexed oldAdmin, address indexed newAdmin);
 
     // ================= MODIFIERS =================
 
@@ -88,7 +98,7 @@ contract TimeDelayWallet is ReentrancyGuard {
         _;
     }
 
-    /// @dev Not applied to cancelTransaction — users must always be able to exit.
+    /// @dev Not applied to cancelTransaction or executeTransaction — users must always be able to exit.
     modifier notPaused() {
         require(!paused, "Paused");
         _;
@@ -148,7 +158,8 @@ contract TimeDelayWallet is ReentrancyGuard {
         returns (uint256)
     {
         // CHECKS
-        require(_value >= minTxAmount, "Below minimum transaction amount");
+        uint256 effectiveMin = tokenMinTxAmount[_token] > 0 ? tokenMinTxAmount[_token] : minTxAmount;
+        require(_value >= effectiveMin, "Below minimum transaction amount");
         require(_to != address(0), "Invalid recipient");
 
         uint256 fee = (_value * feeBps) / BPS_DENOMINATOR;
@@ -189,7 +200,15 @@ contract TimeDelayWallet is ReentrancyGuard {
                 (bool feeSent, ) = platformAdmin.call{value: fee}("");
                 require(feeSent, "Fee transfer failed");
             } else {
-                IERC20(_token).safeTransfer(platformAdmin, fee);
+                // Accumulate fee locally if platformAdmin is blocklisted by the token issuer,
+                // preventing a permanent DoS on queueTransaction for that token.
+                try IERC20(_token).transfer(platformAdmin, fee) returns (bool sent) {
+                    if (!sent) {
+                        unclaimedFees[_token] += fee;
+                    }
+                } catch {
+                    unclaimedFees[_token] += fee;
+                }
             }
         }
 
@@ -200,12 +219,12 @@ contract TimeDelayWallet is ReentrancyGuard {
 
     /// @notice Executes a queued transaction after the delay has elapsed.
     /// @dev CEI: txn.executed = true and lockedAmount decremented before external transfer.
+    ///      notPaused is intentionally omitted — users must be able to execute pending txs even when paused.
     /// @param _txId Transaction ID to execute.
     function executeTransaction(uint256 _txId)
         external
         onlyOwner
         nonReentrant
-        notPaused
     {
         require(_txId < txCounter, "Invalid txId");
 
@@ -224,7 +243,10 @@ contract TimeDelayWallet is ReentrancyGuard {
             (bool success, ) = txn.to.call{value: txn.value}("");
             require(success, "Native transfer failed");
         } else {
-            IERC20(txn.token).safeTransfer(txn.to, txn.value);
+            // Use actual available balance to guard against fee-on-transfer / rebasing token drift.
+            uint256 available = IERC20(txn.token).balanceOf(address(this));
+            uint256 toSend = txn.value > available ? available : txn.value;
+            IERC20(txn.token).safeTransfer(txn.to, toSend);
         }
 
         emit TransactionExecuted(_txId);
@@ -257,15 +279,15 @@ contract TimeDelayWallet is ReentrancyGuard {
 
     // ================= PAUSE =================
 
-    /// @param _paused True to pause, false to unpause.
+    /// @param _paused True to pause (blocks new queues only), false to unpause.
     function setPaused(bool _paused) external onlyPlatform {
         paused = _paused;
+        emit PauseToggled(_paused);
     }
 
     // ================= VIEWS =================
 
     /// @notice Returns available (unlocked) balance for a token.
-    /// @dev May revert on underflow if lockedAmount somehow exceeds actual balance (TWA-04).
     /// @param _token Use address(0) for native ETH/XVC.
     function getAvailableBalance(address _token) public view returns (uint256) {
         uint256 balance = _token == address(0)
@@ -285,13 +307,51 @@ contract TimeDelayWallet is ReentrancyGuard {
     /// @param _newFeeBps New rate in BPS. Max 500 (5%).
     function updateFee(uint256 _newFeeBps) external onlyPlatform {
         require(_newFeeBps <= 500, "Fee too high");
+        emit FeeUpdated(feeBps, _newFeeBps);
         feeBps = _newFeeBps;
     }
 
+    /// @notice Step 1 of two-step platformAdmin transfer. New admin must call acceptPlatformAdmin().
     /// @param _newPlatformAdmin Must not be zero address.
     function updatePlatformAdmin(address _newPlatformAdmin) external onlyPlatform {
         require(_newPlatformAdmin != address(0), "Invalid address");
-        platformAdmin = _newPlatformAdmin;
+        pendingPlatformAdmin = _newPlatformAdmin;
+        emit PlatformAdminTransferStarted(platformAdmin, _newPlatformAdmin);
+    }
+
+    /// @notice Step 2 of two-step platformAdmin transfer. Must be called by pendingPlatformAdmin.
+    function acceptPlatformAdmin() external {
+        require(msg.sender == pendingPlatformAdmin, "Not pending platform admin");
+        address oldAdmin = platformAdmin;
+        platformAdmin = pendingPlatformAdmin;
+        pendingPlatformAdmin = address(0);
+        emit PlatformAdminUpdated(oldAdmin, platformAdmin);
+    }
+
+    // ================= TOKEN MINIMUM =================
+
+    /// @notice Sets a per-token minimum transaction amount, overriding the global minTxAmount.
+    /// @dev Use this to correctly set minimums for low-decimal tokens such as USDC (6 decimals).
+    /// @param _token Token address. Use address(0) for native coin.
+    /// @param _min Minimum amount in the token's native decimals. Set to 0 to revert to global minimum.
+    function setTokenMinTxAmount(address _token, uint256 _min) external onlyOwner {
+        tokenMinTxAmount[_token] = _min;
+    }
+
+    // ================= CLAIM FEES =================
+
+    /// @notice Allows platformAdmin to withdraw fees that accumulated when direct transfer failed.
+    /// @param _token Token address. Use address(0) for native coin.
+    function claimFees(address _token) external onlyPlatform {
+        uint256 amount = unclaimedFees[_token];
+        require(amount > 0, "No unclaimed fees");
+        unclaimedFees[_token] = 0;
+        if (_token == address(0)) {
+            (bool sent, ) = platformAdmin.call{value: amount}("");
+            require(sent, "Transfer failed");
+        } else {
+            IERC20(_token).safeTransfer(platformAdmin, amount);
+        }
     }
 
     // ================= OWNERSHIP =================

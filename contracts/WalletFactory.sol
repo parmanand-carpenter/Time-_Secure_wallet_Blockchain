@@ -23,6 +23,9 @@ contract WalletFactory {
     /// @notice Emitted when a new wallet clone is deployed.
     event WalletCreated(address indexed wallet, address indexed owner);
 
+    /// @notice Emitted when the registry is synced after a wallet ownership transfer.
+    event WalletOwnerSynced(address indexed wallet, address indexed oldOwner, address indexed newOwner);
+
     /// @param _implementation Deployed TimeDelayWallet implementation address.
     /// @param _platformAdmin Platform admin address for all clones.
     constructor(
@@ -52,6 +55,35 @@ contract WalletFactory {
         emit WalletCreated(clone, msg.sender);
 
         return clone;
+    }
+
+    /// @notice Syncs the factory ownership registry to match a wallet's current on-chain owner.
+    /// @dev Call this after TimeDelayWallet.acceptOwnership() completes to keep the registry consistent.
+    ///      Anyone can call — it only reads the wallet's public owner() and updates the mapping.
+    /// @param _wallet Address of the wallet clone to sync.
+    function syncWalletOwner(address _wallet) external {
+        address registeredOwner = _walletOwner[_wallet];
+        require(registeredOwner != address(0), "Not a factory wallet");
+
+        address actualOwner = TimeDelayWallet(payable(_wallet)).owner();
+        if (actualOwner == registeredOwner) return;
+
+        // Remove wallet from old owner's list
+        address[] storage oldList = _wallets[registeredOwner];
+        uint256 len = oldList.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (oldList[i] == _wallet) {
+                oldList[i] = oldList[len - 1];
+                oldList.pop();
+                break;
+            }
+        }
+
+        // Add wallet to new owner's list
+        _wallets[actualOwner].push(_wallet);
+        _walletOwner[_wallet] = actualOwner;
+
+        emit WalletOwnerSynced(_wallet, registeredOwner, actualOwner);
     }
 
     // ================= DISCOVERY =================
