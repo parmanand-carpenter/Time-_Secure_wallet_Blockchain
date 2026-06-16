@@ -1,4 +1,4 @@
-# TimeDelay Wallet
+# Time Secure Wallet
 
 A non-custodial smart contract wallet with a mandatory time delay between scheduling and executing transfers. Built on Solidity using the EIP-1167 minimal proxy (clone) pattern for gas-efficient deployment.
 
