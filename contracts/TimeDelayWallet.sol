@@ -76,7 +76,10 @@ contract TimeDelayWallet is ReentrancyGuard {
         uint256 executeAfter
     );
     event TransactionExecuted(uint256 indexed txId);
+    /// @dev `value` is the amount actually delivered to `to`; see TransactionShortDelivered
+    ///      when it is less than the originally queued amount.
     event TransactionExecutedDetailed(uint256 indexed txId, address indexed to, uint256 value, address token);
+    event TransactionShortDelivered(uint256 indexed txId, uint256 requested, uint256 delivered);
     event TransactionCancelled(uint256 indexed txId);
     event TransactionCancelledDetailed(uint256 indexed txId, address token, uint256 value);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
@@ -167,12 +170,14 @@ contract TimeDelayWallet is ReentrancyGuard {
 
         if (_token == address(0)) {
             uint256 balance = address(this).balance;
-            require(balance >= lockedAmount[address(0)], "Lock overflow");
-            require(balance - lockedAmount[address(0)] >= totalRequired, "Insufficient available balance");
+            uint256 reserved = lockedAmount[address(0)] + unclaimedFees[address(0)];
+            require(balance >= reserved, "Lock overflow");
+            require(balance - reserved >= totalRequired, "Insufficient available balance");
         } else {
             uint256 balance = IERC20(_token).balanceOf(address(this));
-            require(balance >= lockedAmount[_token], "Lock overflow");
-            require(balance - lockedAmount[_token] >= totalRequired, "Insufficient available balance");
+            uint256 reserved = lockedAmount[_token] + unclaimedFees[_token];
+            require(balance >= reserved, "Lock overflow");
+            require(balance - reserved >= totalRequired, "Insufficient available balance");
         }
 
         // EFFECTS
@@ -197,8 +202,12 @@ contract TimeDelayWallet is ReentrancyGuard {
         // INTERACTIONS
         if (fee > 0) {
             if (_token == address(0)) {
+                // Accumulate fee locally if platformAdmin cannot receive native currency,
+                // preventing a permanent DoS on queueTransaction for native-coin queues.
                 (bool feeSent, ) = platformAdmin.call{value: fee}("");
-                require(feeSent, "Fee transfer failed");
+                if (!feeSent) {
+                    unclaimedFees[address(0)] += fee;
+                }
             } else {
                 // Accumulate fee locally if platformAdmin is blocklisted by the token issuer,
                 // preventing a permanent DoS on queueTransaction for that token.
@@ -239,18 +248,26 @@ contract TimeDelayWallet is ReentrancyGuard {
         require(lockedAmount[txn.token] >= txn.value, "Unlock overflow");
         lockedAmount[txn.token] -= txn.value;
 
+        uint256 delivered = txn.value;
+
         if (txn.token == address(0)) {
             (bool success, ) = txn.to.call{value: txn.value}("");
             require(success, "Native transfer failed");
         } else {
-            // Use actual available balance to guard against fee-on-transfer / rebasing token drift.
-            uint256 available = IERC20(txn.token).balanceOf(address(this));
-            uint256 toSend = txn.value > available ? available : txn.value;
-            IERC20(txn.token).safeTransfer(txn.to, toSend);
+            // Use actual available balance (excluding other pending txs' locked value and
+            // unclaimed platform fees) to guard against fee-on-transfer / rebasing token drift.
+            uint256 balance = IERC20(txn.token).balanceOf(address(this));
+            uint256 reserved = lockedAmount[txn.token] + unclaimedFees[txn.token];
+            uint256 available = balance > reserved ? balance - reserved : 0;
+            delivered = txn.value > available ? available : txn.value;
+            IERC20(txn.token).safeTransfer(txn.to, delivered);
         }
 
         emit TransactionExecuted(_txId);
-        emit TransactionExecutedDetailed(_txId, txn.to, txn.value, txn.token);
+        emit TransactionExecutedDetailed(_txId, txn.to, delivered, txn.token);
+        if (delivered < txn.value) {
+            emit TransactionShortDelivered(_txId, txn.value, delivered);
+        }
     }
 
     // ================= CANCEL =================
@@ -293,7 +310,8 @@ contract TimeDelayWallet is ReentrancyGuard {
         uint256 balance = _token == address(0)
             ? address(this).balance
             : IERC20(_token).balanceOf(address(this));
-        return balance - lockedAmount[_token];
+        uint256 reserved = lockedAmount[_token] + unclaimedFees[_token];
+        return balance > reserved ? balance - reserved : 0;
     }
 
     /// @notice Returns the Transaction struct for a given txId.
