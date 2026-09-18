@@ -106,21 +106,26 @@ contract WalletFactory {
         return _wallets[_owner].length;
     }
 
-    /// @notice Returns the owner of a wallet. Returns address(0) if not from this factory.
+    /// @notice Returns the CURRENT owner of a wallet, read live from the wallet itself so it
+    ///         can never go stale after transferOwnership/acceptOwnership. Returns address(0)
+    ///         if the wallet was not created by this factory.
     function getWalletOwner(address _wallet)
         external
         view
         returns (address)
     {
-        return _walletOwner[_wallet];
+        if (_walletOwner[_wallet] == address(0)) return address(0);
+        return TimeDelayWallet(payable(_wallet)).owner();
     }
 
-    /// @notice Returns true if the wallet was created by the given owner through this factory.
+    /// @notice Returns true if the wallet was deployed by this factory and is CURRENTLY
+    ///         owned by `_owner`, read live from the wallet itself.
     function isWalletOf(address _wallet, address _owner)
         external
         view
         returns (bool)
     {
-        return _walletOwner[_wallet] == _owner;
+        if (_walletOwner[_wallet] == address(0)) return false;
+        return TimeDelayWallet(payable(_wallet)).owner() == _owner;
     }
 }
